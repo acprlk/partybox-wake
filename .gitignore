@@ -1,0 +1,5 @@
+/build/
+# Keep private settings from older checkouts out of Git during migration.
+/config.txt
+/partybox-wake
+.DS_Store
