@@ -145,3 +145,7 @@ The tool discovers the JBL control service, subscribes to replies when available
 - The macOS implementation uses Apple’s BLE central workflow for discovering devices, connecting, finding characteristics, and subscribing to replies. [Apple Core Bluetooth Programming Guide](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/PerformingCommonCentralRoleTasks/PerformingCommonCentralRoleTasks.html)
 - JBL documents the dim white standby indicator and Bluetooth reactivation from networked standby in the speaker’s owner’s manual. [JBL PartyBox Encore 2 manual, sections 3.1 and 11](https://support.jbl.com/on/demandware.static/-/Sites-masterCatalog_Harman/default/dw7bcebe57/pdfs/JBL_PARTYBOX_Encore_2_OM_EN_V7.pdf)
 - The speaker-initiated audio reconnect uses the Mac’s Classic Bluetooth address. macOS can also initiate the link to the paired speaker. [PartyPair audio reconnect command](https://github.com/louim-lbs/PartyPair/blob/main/docs/PROTOCOL.md#7-other-useful-commands) · [Apple IOBluetooth connection](https://developer.apple.com/documentation/iobluetooth/iobluetoothdevice/openconnection())
+
+## License
+
+PartyBox Wake for Mac is available under the [MIT License](LICENSE).
