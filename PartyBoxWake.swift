@@ -8,11 +8,12 @@ let replies = CBUUID(string: "65786365-6C70-6F69-6E74-2E636F6D0001")
 let commands = CBUUID(string: "65786365-6C70-6F69-6E74-2E636F6D0002")
 enum PowerAction: String {
     case wake
+    case wakeAndConnect = "wake and connect"
     case powerOff = "power-off"
 
     // Both JBL power actions use opcode 0x03 with a single payload byte.
     var packet: Data {
-        Data([0xAA, 0x03, 0x01, self == .wake ? 0x05 : 0x04])
+        Data([0xAA, 0x03, 0x01, self == .powerOff ? 0x04 : 0x05])
     }
 }
 
@@ -24,6 +25,9 @@ let usage = """
 Usage
   partybox-wake                Wake the configured default speaker
   partybox-wake --wake-last    Wake the speaker from the last successful request
+  partybox-wake --connect      Wake the default speaker and connect it for Mac audio
+  partybox-wake --wake-last --connect
+                               Wake and connect the last successfully woken speaker
   partybox-wake --off          Turn off the configured default speaker
   partybox-wake --off-last     Turn off the last successfully woken speaker
   partybox-wake --off --id UUID
@@ -135,21 +139,29 @@ struct Configuration {
 }
 
 /// Parse the CLI before starting Bluetooth. Only --list returns a nil discovery target.
-func parseCommand(arguments: [String]) -> (action: PowerAction, target: SpeakerTarget?) {
+func parseCommand(arguments input: [String]) -> (action: PowerAction, target: SpeakerTarget?) {
+    let arguments = input.filter { $0 != "--connect" }
+    let connectAudio = arguments.count != input.count
+    if connectAudio {
+        let validWake = arguments.isEmpty || arguments == ["--wake-last"] ||
+            (arguments.count == 2 && arguments[0] == "--id" && UUID(uuidString: arguments[1]) != nil)
+        guard input.count == arguments.count + 1, validWake else { fail(usage, code: 64) }
+    }
+    let wakeAction: PowerAction = connectAudio ? .wakeAndConnect : .wake
     if arguments == ["--help"] || arguments == ["-h"] {
         print(usage)
         exit(0)
     }
     if arguments == ["--list"] { return (.wake, nil) }
-    if arguments.isEmpty { return (.wake, Configuration().target(for: .preferred)) }
-    if arguments == ["--wake-last"] { return (.wake, Configuration().target(for: .lastWake)) }
+    if arguments.isEmpty { return (wakeAction, Configuration().target(for: .preferred)) }
+    if arguments == ["--wake-last"] { return (wakeAction, Configuration().target(for: .lastWake)) }
     if arguments == ["--off"] { return (.powerOff, Configuration().target(for: .preferred)) }
     if arguments == ["--off-last"] { return (.powerOff, Configuration().target(for: .lastWake)) }
     if arguments.count == 3, arguments.starts(with: ["--off", "--id"]), let id = UUID(uuidString: arguments[2]) {
         return (.powerOff, SpeakerTarget(id: id, name: nil))
     }
     guard arguments.count >= 2, let id = UUID(uuidString: arguments[1]) else { fail(usage, code: 64) }
-    if arguments[0] == "--id", arguments.count == 2 { return (.wake, SpeakerTarget(id: id, name: nil)) }
+    if arguments[0] == "--id", arguments.count == 2 { return (wakeAction, SpeakerTarget(id: id, name: nil)) }
     guard arguments[0] == "--save", arguments.count <= 3 else { fail(usage, code: 64) }
     var name: String?
     if arguments.count == 3 {
@@ -177,6 +189,8 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var writeAccepted = false
     private var receivedDeviceInfo = false
     private var acknowledged = false
+    private var audioConnecting = false
+    private var speakerAddress: String?
     private let start = ProcessInfo.processInfo.systemUptime
 
     /// Prepare a power-control session, or a discovery-only session when the target is nil.
@@ -202,7 +216,9 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     /// Classify the collected Bluetooth replies and persist history only on protocol-level success.
-    func reportOutcome(_ reason: String) -> Never {
+    func reportOutcome(_ reason: String) {
+        // A wake timer or BLE disconnect can arrive while the independent audio link is opening.
+        guard !audioConnecting else { return }
         if target == nil {
             finish("\(reason) Bluetooth discovery did not finish.", code: 1)
         }
@@ -222,6 +238,10 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let name = target?.name ?? speaker.name
             let singleLineName = name.flatMap { $0.rangeOfCharacter(from: .newlines) == nil ? $0 : nil }
             Configuration.store(SpeakerTarget(id: speaker.identifier, name: singleLineName), in: .lastWake)
+            if action == .wakeAndConnect {
+                connectForAudio(speaker)
+                return
+            }
         }
         if acknowledged {
             finish("\(reason) Speaker acknowledged the request. Check the power light to confirm wake.", code: 0)
@@ -230,6 +250,28 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             finish("\(reason) Bluetooth write accepted and speaker settings received. Check the power light to confirm wake.", code: 0)
         }
         finish("\(reason) No JBL acknowledgement of the wake request was observed.", code: 2)
+    }
+
+    /// After a successful wake, hand off to the paired audio device and verify it in Core Audio.
+    private func connectForAudio(_ peripheral: CBPeripheral) {
+        audioConnecting = true
+        do {
+            let audio = try BluetoothAudio(address: speakerAddress, names: [peripheral.name, target?.name].compactMap { $0 })
+            if audio.isAvailableForOutput() { finish("Speaker is already available for Mac audio.", code: 0) }
+            log("Wake confirmed. Connecting the speaker for Mac audio…")
+            if peripheral.state == .connected, let writer, let packet = BluetoothAudio.reconnectPacket() {
+                peripheral.writeValue(packet, for: writer, type: .withResponse)
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let available = audio.waitForOutput()
+                DispatchQueue.main.async {
+                    if available { self.finish("Speaker connected and available in Sound → Output.", code: 0) }
+                    self.finish("Wake succeeded, but the speaker did not appear in Sound → Output.", code: 3)
+                }
+            }
+        } catch {
+            finish("Wake succeeded. \(error.localizedDescription)", code: 3)
+        }
     }
 
     /// Wait for the adapter, then scan or connect directly to a cached UUID.
@@ -362,6 +404,10 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     /// Record the Bluetooth write result while waiting for the speaker's own response.
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if audioConnecting {
+            if let error { log("Speaker audio reconnect request: \(error.localizedDescription)") }
+            return
+        }
         if let error { finish("Bluetooth write failed: \(error.localizedDescription)", code: 1) }
         writeAccepted = true
         log("Bluetooth write accepted. Waiting for a JBL reply.")
@@ -369,10 +415,12 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     /// Recognize JBL settings replies, acknowledgements, and explicit command rejections.
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard !audioConnecting else { return }
         if let error { log("Reply error: \(error.localizedDescription)"); return }
         guard characteristic.uuid == replies, let value = characteristic.value else { return }
         let bytes = Array(value)
         guard bytes.count >= 3, bytes[0] == 0xAA else { return }
+        if action == .wakeAndConnect, let address = classicAddress(in: bytes) { speakerAddress = address }
         log(String(format: "JBL reply 0x%02X (%d bytes).", bytes[1], bytes.count))
         // The Encore 2 also returns settings (opcode 0x12) after a successful wake.
         // An explicit ACK echoes the power opcode, 0x03, followed by its status byte.
@@ -384,8 +432,14 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 }
 
-let command = parseCommand(arguments: Array(CommandLine.arguments.dropFirst()))
-let client = PartyBox(target: command.target, action: command.action)
-client.central = CBCentralManager(delegate: client, queue: .main)
-DispatchQueue.main.asyncAfter(deadline: .now() + 55) { client.reportOutcome("Bluetooth session timed out.") }
-RunLoop.main.run()
+@main
+struct PartyBoxWake {
+    /// Start the command on the main run loop so CoreBluetooth can deliver its callbacks.
+    static func main() {
+        let command = parseCommand(arguments: Array(CommandLine.arguments.dropFirst()))
+        let client = PartyBox(target: command.target, action: command.action)
+        client.central = CBCentralManager(delegate: client, queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 55) { client.reportOutcome("Bluetooth session timed out.") }
+        RunLoop.main.run()
+    }
+}

@@ -5,8 +5,8 @@ all: build/partybox-wake build/partybox-wake.config
 build:
 	mkdir -p $@
 
-build/partybox-wake: PartyBoxWake.swift Info.plist | build
-	xcrun swiftc -O PartyBoxWake.swift -o $@ \
+build/partybox-wake: PartyBoxWake.swift BluetoothAudio.swift Info.plist | build
+	xcrun swiftc -O PartyBoxWake.swift BluetoothAudio.swift -o $@ \
 	    -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
 # Initialize once. Subsequent builds preserve the local selection and wake history.

@@ -1,6 +1,6 @@
 # PartyBox Wake for Mac
 
-Wake a JBL PartyBox from standby or send it a power-off request using your Mac’s built-in Bluetooth. The tool opens a Bluetooth Low Energy (BLE) connection to the speaker you select and sends the selected power request. You can run it while the Mac is disconnected from the speaker for audio.
+Wake a JBL PartyBox from standby or send it a power-off request using your Mac’s built-in Bluetooth. The tool opens a Bluetooth Low Energy (BLE) connection to the speaker you select and sends the selected power request. You can run it while the Mac is disconnected from the speaker for audio. Add `--connect` to a wake command to reconnect for playback.
 
 **Wake and power-off manually verified on the JBL PartyBox Encore 2** with an Apple silicon MacBook Pro. The speaker was plugged into the wall, its power button was dim white, and the wake was physically confirmed. Other PartyBox models and battery-only standby are unverified.
 
@@ -58,7 +58,22 @@ With no arguments, the tool wakes the default set with `--save`. To wake the las
 
 For example, save speaker A with `--save`, then successfully wake speaker B with `--id`. Running the tool without arguments wakes A. Running it with `--wake-last` immediately after waking B targets B. A scan, a save, or a failed wake preserves the previous history. A fresh installation reports an empty history until its first successful wake.
 
-The tool reads your selection, connects, sends one wake request, and disconnects. With a name configured, it scans for the saved UUID first. If that UUID is absent after 15 seconds, it connects to a single exact name match. If several entries match the name, it prints their UUIDs so you can test the right one. You can also invoke the executable by its full path from another directory. To listen to music, select the awakened speaker in your Mac’s sound output settings.
+The tool reads your selection, connects, sends one wake request, and disconnects. With a name configured, it scans for the saved UUID first. If that UUID is absent after 15 seconds, it connects to a single exact name match. If several entries match the name, it prints their UUIDs so you can test the right one. You can also invoke the executable by its full path from another directory.
+
+## Connect for audio after waking
+
+Pair the PartyBox once in **System Settings → Bluetooth** while it is on. Once the speaker is in standby, use either command:
+
+```sh
+./build/partybox-wake --connect
+./build/partybox-wake --wake-last --connect
+```
+
+The first uses the saved default and the second uses the last successfully woken speaker. You can also use `--id YOUR-UUID --connect` for a specific speaker. Either flag order works with `--wake-last`.
+
+After the speaker replies to the wake request, the tool asks it to reconnect to this Mac and, if needed, initiates the paired Bluetooth connection from macOS. It matches the paired device by the Classic Bluetooth address from the speaker’s settings when available, or by a unique exact Bluetooth name. The command succeeds once macOS lists the speaker as a Bluetooth sound output. If macOS keeps another output selected, choose the PartyBox in **Sound → Output** for playback.
+
+If the wake succeeds but the audio connection fails, the command returns exit code `3` and retains the successful wake in history. For a manual test, start with the speaker asleep and disconnected for audio, run the first command, then check **Sound → Output** and play a short clip through the speaker. Put it back in standby, disconnect it for audio, and repeat with the second command.
 
 ## Turn off a speaker
 
@@ -113,3 +128,4 @@ The tool discovers the JBL control service, subscribes to replies when available
 - The initial BLE wake experiment was informed by independent tests on the PartyBox 710. The Encore 2 procedure above comes from testing on the Encore 2 itself. [PartyPair protocol notes](https://github.com/louim-lbs/PartyPair/blob/main/docs/PROTOCOL.md#5-waking-a-speaker)
 - The macOS implementation uses Apple’s BLE central workflow for discovering devices, connecting, finding characteristics, and subscribing to replies. [Apple Core Bluetooth Programming Guide](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/PerformingCommonCentralRoleTasks/PerformingCommonCentralRoleTasks.html)
 - JBL documents the dim white standby indicator and Bluetooth reactivation from networked standby in the speaker’s owner’s manual. [JBL PartyBox Encore 2 manual, sections 3.1 and 11](https://support.jbl.com/on/demandware.static/-/Sites-masterCatalog_Harman/default/dw7bcebe57/pdfs/JBL_PARTYBOX_Encore_2_OM_EN_V7.pdf)
+- The speaker-initiated audio reconnect uses the Mac’s Classic Bluetooth address. macOS can also initiate the link to the paired speaker. [PartyPair audio reconnect command](https://github.com/louim-lbs/PartyPair/blob/main/docs/PROTOCOL.md#7-other-useful-commands) · [Apple IOBluetooth connection](https://developer.apple.com/documentation/iobluetooth/iobluetoothdevice/openconnection())
