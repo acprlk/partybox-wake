@@ -1,8 +1,8 @@
 # PartyBox Wake for Mac
 
-Wake a JBL PartyBox from standby using your Mac’s built-in Bluetooth. The tool opens a Bluetooth Low Energy (BLE) connection to the speaker you select and sends a wake request. You can run it while the Mac is disconnected from the speaker for audio.
+Wake a JBL PartyBox from standby or send it a power-off request using your Mac’s built-in Bluetooth. The tool opens a Bluetooth Low Energy (BLE) connection to the speaker you select and sends the selected power request. You can run it while the Mac is disconnected from the speaker for audio.
 
-**Tested on the JBL PartyBox Encore 2** with an Apple silicon MacBook Pro. The speaker was plugged into the wall, its power button was dim white, and the wake was physically confirmed. Other PartyBox models and battery-only standby are unverified.
+**Wake and power-off manually verified on the JBL PartyBox Encore 2** with an Apple silicon MacBook Pro. The speaker was plugged into the wall, its power button was dim white, and the wake was physically confirmed. Other PartyBox models and battery-only standby are unverified.
 
 ## Build
 
@@ -60,6 +60,18 @@ For example, save speaker A with `--save`, then successfully wake speaker B with
 
 The tool reads your selection, connects, sends one wake request, and disconnects. With a name configured, it scans for the saved UUID first. If that UUID is absent after 15 seconds, it connects to a single exact name match. If several entries match the name, it prints their UUIDs so you can test the right one. You can also invoke the executable by its full path from another directory. To listen to music, select the awakened speaker in your Mac’s sound output settings.
 
+## Turn off a speaker
+
+With the speaker on, run the command for your intended target.
+
+| Command | Target |
+| --- | --- |
+| `./build/partybox-wake --off` | Configured default speaker |
+| `./build/partybox-wake --off-last` | Last successfully woken speaker |
+| `./build/partybox-wake --off --id YOUR-UUID` | The Bluetooth entry you specify |
+
+Power-off preserves the saved default and wake history. Exit code `0` means the speaker acknowledged the power-off request. If it disconnects before acknowledging, the tool reports an unconfirmed result (exit code `2`). Check the power button on the Encore 2: dim white indicates standby and unlit indicates power off.
+
 ## Configuration and build files
 
 The repository root contains the standard `partybox-wake.config` template. The first `make` copies it into `build/`. Later builds preserve that local copy. Git ignores the entire `build/` directory, including the executable, local config, and lock file. To personalize this Mac, edit **`build/partybox-wake.config`** or use `--save`.
@@ -93,7 +105,7 @@ When upgrading from the earlier layout, the first build imports the UUID and opt
 
 ## Protocol
 
-The tool discovers the JBL control service, subscribes to replies when available, and writes the four bytes `AA 03 01 05` to characteristic `65786365-6C70-6F69-6E74-2E636F6D0002`. It uses a Bluetooth write with response and waits up to ten seconds for JBL replies.
+The tool discovers the JBL control service, subscribes to replies when available, and writes `AA 03 01 05` for wake or `AA 03 01 04` for power off to characteristic `65786365-6C70-6F69-6E74-2E636F6D0002`. It uses a Bluetooth write with response and waits up to ten seconds for JBL replies.
 
 ## References
 

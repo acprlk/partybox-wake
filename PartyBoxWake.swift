@@ -6,7 +6,15 @@ import Foundation
 let control = CBUUID(string: "65786365-6C70-6F69-6E74-2E636F6D0000")
 let replies = CBUUID(string: "65786365-6C70-6F69-6E74-2E636F6D0001")
 let commands = CBUUID(string: "65786365-6C70-6F69-6E74-2E636F6D0002")
-let wake = Data([0xAA, 0x03, 0x01, 0x05])
+enum PowerAction: String {
+    case wake
+    case powerOff = "power-off"
+
+    // Both JBL power actions use opcode 0x03 with a single payload byte.
+    var packet: Data {
+        Data([0xAA, 0x03, 0x01, self == .wake ? 0x05 : 0x04])
+    }
+}
 
 // Resolve symlinks so a launcher can run the executable from any working directory.
 let configFile = Bundle.main.executableURL!.resolvingSymlinksInPath()
@@ -16,6 +24,10 @@ let usage = """
 Usage
   partybox-wake                Wake the configured default speaker
   partybox-wake --wake-last    Wake the speaker from the last successful request
+  partybox-wake --off          Turn off the configured default speaker
+  partybox-wake --off-last     Turn off the last successfully woken speaker
+  partybox-wake --off --id UUID
+                               Turn off a specific Bluetooth entry
   partybox-wake --list         Show nearby Bluetooth LE names and UUIDs
   partybox-wake --id UUID      Wake a specific entry and record success in history
   partybox-wake --save UUID [NAME]
@@ -123,16 +135,21 @@ struct Configuration {
 }
 
 /// Parse the CLI before starting Bluetooth. Only --list returns a nil discovery target.
-func selectedSpeaker(arguments: [String]) -> SpeakerTarget? {
+func parseCommand(arguments: [String]) -> (action: PowerAction, target: SpeakerTarget?) {
     if arguments == ["--help"] || arguments == ["-h"] {
         print(usage)
         exit(0)
     }
-    if arguments == ["--list"] { return nil }
-    if arguments.isEmpty { return Configuration().target(for: .preferred) }
-    if arguments == ["--wake-last"] { return Configuration().target(for: .lastWake) }
+    if arguments == ["--list"] { return (.wake, nil) }
+    if arguments.isEmpty { return (.wake, Configuration().target(for: .preferred)) }
+    if arguments == ["--wake-last"] { return (.wake, Configuration().target(for: .lastWake)) }
+    if arguments == ["--off"] { return (.powerOff, Configuration().target(for: .preferred)) }
+    if arguments == ["--off-last"] { return (.powerOff, Configuration().target(for: .lastWake)) }
+    if arguments.count == 3, arguments.starts(with: ["--off", "--id"]), let id = UUID(uuidString: arguments[2]) {
+        return (.powerOff, SpeakerTarget(id: id, name: nil))
+    }
     guard arguments.count >= 2, let id = UUID(uuidString: arguments[1]) else { fail(usage, code: 64) }
-    if arguments[0] == "--id", arguments.count == 2 { return SpeakerTarget(id: id, name: nil) }
+    if arguments[0] == "--id", arguments.count == 2 { return (.wake, SpeakerTarget(id: id, name: nil)) }
     guard arguments[0] == "--save", arguments.count <= 3 else { fail(usage, code: 64) }
     var name: String?
     if arguments.count == 3 {
@@ -149,6 +166,7 @@ func selectedSpeaker(arguments: [String]) -> SpeakerTarget? {
 
 final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     let target: SpeakerTarget?
+    let action: PowerAction
     var central: CBCentralManager!
 
     private var speaker: CBPeripheral?
@@ -161,8 +179,9 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var acknowledged = false
     private let start = ProcessInfo.processInfo.systemUptime
 
-    /// Prepare a wake session, or a discovery-only session when the target is nil.
-    init(target: SpeakerTarget?) {
+    /// Prepare a power-control session, or a discovery-only session when the target is nil.
+    init(target: SpeakerTarget?, action: PowerAction) {
+        self.action = action
         self.target = target
         super.init()
     }
@@ -188,7 +207,15 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             finish("\(reason) Bluetooth discovery did not finish.", code: 1)
         }
         if !sent {
-            finish("\(reason) No wake request was sent. Run --list to check which entries are visible.", code: 1)
+            finish("\(reason) No \(action.rawValue) request was sent. Run --list to check which entries are visible.", code: 1)
+        }
+        // A speaker can drop the link during shutdown. Only a JBL ACK confirms acceptance.
+        // Returning here also keeps every power-off outcome out of the wake history.
+        if action == .powerOff {
+            if acknowledged {
+                finish("\(reason) Speaker acknowledged the power-off request. Check the power light.", code: 0)
+            }
+            finish("\(reason) Power-off request sent without a JBL acknowledgement. Check the power light.", code: 2)
         }
         // Record the peripheral that actually replied. A name fallback can select a new UUID.
         if let speaker, acknowledged || (writeAccepted && receivedDeviceInfo) {
@@ -276,7 +303,7 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         peripheral.discoverServices([control])
     }
 
-    /// Report a connection failure before any wake request could be sent.
+    /// Report a connection failure before any power request could be sent.
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         finish("Connection failed. \(error?.localizedDescription ?? "No reason supplied.")", code: 1)
     }
@@ -295,7 +322,7 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         peripheral.discoverCharacteristics([commands, replies], for: service)
     }
 
-    /// Choose the writable endpoint and start listening before sending the wake request.
+    /// Choose the writable endpoint and start listening before sending the power request.
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error { finish(error.localizedDescription, code: 1) }
         let characteristics = service.characteristics ?? []
@@ -307,11 +334,11 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             peripheral.setNotifyValue(true, for: rx)
             // A slow or unsupported subscription must not consume the short connection window.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if !self.sent { self.log("Reply subscription is pending."); self.sendWake(peripheral) }
+                if !self.sent { self.log("Reply subscription is pending."); self.sendPowerRequest(peripheral) }
             }
         } else {
             log("Reply notifications unavailable.")
-            sendWake(peripheral)
+            sendPowerRequest(peripheral)
         }
     }
 
@@ -319,15 +346,17 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if let error { log("Reply subscription failed: \(error.localizedDescription)") }
         else if characteristic.isNotifying { log("Listening for JBL replies.") }
-        sendWake(peripheral)
+        sendPowerRequest(peripheral)
     }
 
-    /// Send at most one wake request and give the speaker ten seconds to reply.
-    func sendWake(_ peripheral: CBPeripheral) {
+    /// Send at most one power request and give the speaker ten seconds to reply.
+    func sendPowerRequest(_ peripheral: CBPeripheral) {
         guard !sent, let writer else { return }
         sent = true
-        log("Sending AA 03 01 05.")
-        peripheral.writeValue(wake, for: writer, type: .withResponse)
+        let packet = action.packet
+        let hex = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        log("Sending \(action.rawValue) request: \(hex).")
+        peripheral.writeValue(packet, for: writer, type: .withResponse)
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.reportOutcome("Reply window ended.") }
     }
 
@@ -355,7 +384,8 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 }
 
-let client = PartyBox(target: selectedSpeaker(arguments: Array(CommandLine.arguments.dropFirst())))
+let command = parseCommand(arguments: Array(CommandLine.arguments.dropFirst()))
+let client = PartyBox(target: command.target, action: command.action)
 client.central = CBCentralManager(delegate: client, queue: .main)
 DispatchQueue.main.asyncAfter(deadline: .now() + 55) { client.reportOutcome("Bluetooth session timed out.") }
 RunLoop.main.run()
