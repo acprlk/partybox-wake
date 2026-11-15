@@ -28,6 +28,22 @@ private func compactAddress(_ value: String) -> String {
     value.replacingOccurrences(of: "-", with: "").replacingOccurrences(of: ":", with: "").lowercased()
 }
 
+/// Convert a Classic Bluetooth address to six bytes for comparison with an advertisement.
+func addressBytes(_ text: String) -> Data? {
+    let parts = text.split(whereSeparator: { $0 == "-" || $0 == ":" })
+    let bytes = parts.compactMap { UInt8($0, radix: 16) }
+    guard parts.count == 6, parts.allSatisfy({ $0.count == 2 }), bytes.count == 6,
+          !bytes.allSatisfy({ $0 == 0 }), !bytes.allSatisfy({ $0 == 0xff }) else { return nil }
+    return Data(bytes)
+}
+
+/// The Encore 2 advertises its Classic address in the payload following company ID 0x0ECB.
+func advertisesPairedAddress(_ address: Data, in manufacturerData: Data) -> Bool {
+    guard manufacturerData.starts(with: [0xcb, 0x0e]), address.count == 6 else { return false }
+    let payload = manufacturerData.dropFirst(2)
+    return payload.range(of: address) != nil || payload.range(of: Data(address.reversed())) != nil
+}
+
 /// Return the UInt32 entries of a Core Audio property (IDs, streams, or a scalar value).
 private func integers(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
                       scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [UInt32] {
@@ -91,14 +107,11 @@ struct BluetoothAudio {
         return false
     }
 
-    /// Ask the paired speaker to reconnect its audio profile to this Mac's Classic address.
+    /// Build the audio reconnect command using this Mac’s Classic Bluetooth address.
     static func reconnectPacket() -> Data? {
-        guard let address = IOBluetoothHostController.default()?.addressAsString() else { return nil }
-        let parts = address.split { $0 == ":" || $0 == "-" }
-        let bytes = parts.compactMap { UInt8($0, radix: 16) }
-        guard parts.count == 6, bytes.count == 6, !bytes.allSatisfy({ $0 == 0 }),
-              !bytes.allSatisfy({ $0 == 0xff }) else { return nil }
-        return Data([0xAA, 0x84, 0x06] + bytes)
+        guard let text = IOBluetoothHostController.default()?.addressAsString(),
+              let bytes = addressBytes(text) else { return nil }
+        return Data([0xAA, 0x84, 0x06]) + bytes
     }
 
     /// Give the speaker time to reconnect, then initiate a paired Classic connection from macOS.

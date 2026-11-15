@@ -16,6 +16,15 @@ This compiles `build/partybox-wake` using Swift and Apple’s CoreBluetooth fram
 
 ## Choose a speaker
 
+For a paired speaker, save its exact Bluetooth name once. Replace the example with the name shown in **System Settings → Bluetooth**. The speaker can be disconnected for audio.
+
+```sh
+./build/partybox-wake --save-name "My living room PartyBox"
+./build/partybox-wake --connect
+```
+
+Using `--save-name` clears the previous default UUID and preserves wake history. You can also set just `default_name` in the local config and leave `default_uuid` blank. Existing configs with both fields continue to work. If you prefer to select an entry by UUID, use these steps.
+
 1. With the speaker in standby and within Bluetooth range, scan from your Mac.
 
    ```sh
@@ -50,7 +59,7 @@ This compiles `build/partybox-wake` using Swift and Apple’s CoreBluetooth fram
 ./build/partybox-wake
 ```
 
-With no arguments, the tool wakes the default set with `--save`. To wake the last speaker that successfully responded, run this instead.
+With no arguments, the tool wakes the default set with `--save-name` or `--save`. To wake the last speaker that successfully responded, run this instead.
 
 ```sh
 ./build/partybox-wake --wake-last
@@ -58,7 +67,7 @@ With no arguments, the tool wakes the default set with `--save`. To wake the las
 
 For example, save speaker A with `--save`, then successfully wake speaker B with `--id`. Running the tool without arguments wakes A. Running it with `--wake-last` immediately after waking B targets B. A scan, a save, or a failed wake preserves the previous history. A fresh installation reports an empty history until its first successful wake.
 
-The tool reads your selection, connects, sends one wake request, and disconnects. With a name configured, it scans for the saved UUID first. If that UUID is absent after 15 seconds, it connects to a single exact name match. If several entries match the name, it prints their UUIDs so you can test the right one. You can also invoke the executable by its full path from another directory.
+Wake and power-off use the same Bluetooth LE selection. With a saved name, the tool scans for up to 15 seconds and uses the saved UUID as soon as it appears. At the end of the scan, it considers exact, case-sensitive name matches. If several entries share the name, the tool looks for the Mac’s paired audio address in their manufacturer data. It chooses a single address match, or prints the candidates if the match is ambiguous. A single exact name match works on its own. With only a UUID, the tool can also connect using macOS’s cached entry.
 
 ## Connect for audio after waking
 
@@ -71,7 +80,9 @@ Pair the PartyBox once in **System Settings → Bluetooth** while it is on. Once
 
 The first uses the saved default and the second uses the last successfully woken speaker. You can also use `--id YOUR-UUID --connect` for a specific speaker. Either flag order works with `--wake-last`.
 
-After the speaker replies to the wake request, the tool asks it to reconnect to this Mac and, if needed, initiates the paired Bluetooth connection from macOS. It matches the paired device by the Classic Bluetooth address from the speaker’s settings when available, or by a unique exact Bluetooth name. The command succeeds once macOS lists the speaker as a Bluetooth sound output. If macOS keeps another output selected, choose the PartyBox in **Sound → Output** for playback.
+Plain wake sends only the power command. The Encore 2 can then reconnect to its last Bluetooth device on its own, even after you clicked **Disconnect** on the Mac. We observed the speaker return as an available Mac audio output about ten seconds after a plain wake. [JBL Encore 2 manual, §6.1](https://support.jbl.com/on/demandware.static/-/Sites-masterCatalog_Harman/default/dw7bcebe57/pdfs/JBL_PARTYBOX_Encore_2_OM_EN_V7.pdf)
+
+With `--connect`, the tool also checks whether the speaker is available for Mac audio. It identifies the paired device by the Classic Bluetooth address in the speaker’s settings, or by a unique exact name when the address is unavailable. If the output is missing, the tool requests a reconnect when possible and checks for the output, asking macOS to connect if needed. The command succeeds once the speaker is available. macOS controls the selected playback output. You can choose the PartyBox in **Sound → Output**.
 
 If the wake succeeds but the audio connection fails, the command returns exit code `3` and retains the successful wake in history. For a manual test, start with the speaker asleep and disconnected for audio, run the first command, then check **Sound → Output** and play a short clip through the speaker. Put it back in standby, disconnect it for audio, and repeat with the second command.
 
@@ -85,27 +96,31 @@ With the speaker on, run the command for your intended target.
 | `./build/partybox-wake --off-last` | Last successfully woken speaker |
 | `./build/partybox-wake --off --id YOUR-UUID` | The Bluetooth entry you specify |
 
-Power-off preserves the saved default and wake history. Exit code `0` means the speaker acknowledged the power-off request. If it disconnects before acknowledging, the tool reports an unconfirmed result (exit code `2`). Check the power button on the Encore 2: dim white indicates standby and unlit indicates power off.
+Power-off preserves wake history. Only `--off` targeting the default speaker can refresh `default_uuid` when automatic updates are enabled. Exit code `0` means the speaker acknowledged the power-off request. If it disconnects before acknowledging, the tool reports an unconfirmed result (exit code `2`). Check the power button on the Encore 2: dim white indicates standby and unlit indicates power off.
 
 ## Configuration and build files
 
-The repository root contains the standard `partybox-wake.config` template. The first `make` copies it into `build/`. Later builds preserve that local copy. Git ignores the entire `build/` directory, including the executable, local config, and lock file. To personalize this Mac, edit **`build/partybox-wake.config`** or use `--save`.
+The repository root contains the standard `partybox-wake.config` template. The first `make` copies it into `build/`. Later builds preserve that local copy. Git ignores the entire `build/` directory, including the executable, local config, and lock file. To personalize this Mac, edit **`build/partybox-wake.config`** or use `--save-name` or `--save`.
 
 The file uses UTF-8 text with one `key=value` pair per line. Blank lines and lines beginning with `#` are allowed. Enter names literally, including any spaces, without surrounding quotes.
 
 ```ini
 default_uuid=
 default_name=
+autoupdate_uuid=false
 last_wake_uuid=
 last_wake_name=
 ```
 
 | Key | Used for |
 | --- | --- |
-| `default_uuid` | The default device UUID from `--list` on this Mac. Set it with `--save UUID`. |
-| `default_name` | Optional exact Bluetooth name for the default speaker if its UUID changes. |
-| `last_wake_uuid` | The actual connected UUID from the most recent successful wake, including a connection found by name. |
+| `default_uuid` | Optional default device UUID from `--list` on this Mac. Set it with `--save UUID`. |
+| `default_name` | Exact Bluetooth name for name-based discovery, optional when a UUID is saved. |
+| `autoupdate_uuid` | Set to `true` to save a replacement UUID when a scan finds the default speaker by name. Defaults to `false` when omitted. |
+| `last_wake_uuid` | The actual connected UUID from the most recent successful wake, including an entry selected by name or paired address. |
 | `last_wake_name` | The Bluetooth name for that speaker when available, used as a fallback by `--wake-last`. |
+
+To enable automatic updates on an existing installation, add `autoupdate_uuid=true` to `build/partybox-wake.config` or change the existing setting. On a default wake, `--connect`, or `--off`, the saved UUID takes priority. When the UUID is blank or absent for the full scan, the tool saves the selected UUID before connecting, even if the subsequent power request fails. With the setting off, it uses that match for the current run only. Unresolved matches leave the config untouched and the command prints their UUIDs. Commands targeting the last speaker or an explicit UUID keep the default selection intact.
 
 A successful wake for history purposes means the speaker acknowledged the power command, or the Bluetooth write succeeded and the speaker returned settings during the request. The Encore 2 showed the latter behavior in a physically confirmed wake test. Check its power light when testing a new speaker. The local config must be writable to record history.
 
@@ -124,6 +139,7 @@ The tool discovers the JBL control service, subscribes to replies when available
 
 ## References
 
+- The paired-address match comes from observing the Encore 2 on a Mac. One of two same-name BLE entries included the paired audio address in manufacturer data with company ID `0x0ECB`. Other models may advertise differently.
 - The control service, write and notify characteristics, four-byte power command, and JBL reply format came from the PartyBox 520 protocol findings. [partybox-companion findings](https://github.com/jklingberg/partybox-companion/blob/main/docs/reverse-engineering/discoveries.md)
 - The initial BLE wake experiment was informed by independent tests on the PartyBox 710. The Encore 2 procedure above comes from testing on the Encore 2 itself. [PartyPair protocol notes](https://github.com/louim-lbs/PartyPair/blob/main/docs/PROTOCOL.md#5-waking-a-speaker)
 - The macOS implementation uses Apple’s BLE central workflow for discovering devices, connecting, finding characteristics, and subscribing to replies. [Apple Core Bluetooth Programming Guide](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/PerformingCommonCentralRoleTasks/PerformingCommonCentralRoleTasks.html)

@@ -34,9 +34,14 @@ Usage
                                Turn off a specific Bluetooth entry
   partybox-wake --list         Show nearby Bluetooth LE names and UUIDs
   partybox-wake --id UUID      Wake a specific entry and record success in history
+  partybox-wake --save-name NAME
+                               Set the default by exact name and clear its saved UUID
   partybox-wake --save UUID [NAME]
                                Set the default UUID and optional exact Bluetooth name
   partybox-wake --help         Show this help
+
+A plain wake sends only the power command. The speaker may reconnect to audio on its own.
+Add --connect to check for a Mac audio output and request a connection if needed.
 
 Config file: \(configFile.path)
 """
@@ -48,8 +53,9 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
 }
 
 struct SpeakerTarget {
-    let id: UUID
+    let id: UUID?
     let name: String?
+    var updateDefaultOnNameMatch = false
 }
 
 enum SpeakerSlot: String {
@@ -100,14 +106,18 @@ struct Configuration {
     /// Resolve a default or historical selection and explain how to populate an empty slot.
     func target(for slot: SpeakerSlot) -> SpeakerTarget {
         let raw = value(for: slot.uuidKey)
-        if raw.isEmpty {
-            fail(slot == .lastWake ? "No successful wake recorded. Wake a speaker with --id UUID or your saved default first."
-                                   : "No default speaker saved. Run --list, then --save UUID [NAME].")
-        }
-        guard let id = UUID(uuidString: raw) else { fail("Invalid UUID in \(slot.uuidKey) in \(configFile.path).") }
         let name = value(for: slot.nameKey)
-        return SpeakerTarget(id: id, name: name.isEmpty ? nil : name)
+        let id = UUID(uuidString: raw)
+        if !raw.isEmpty && id == nil { fail("Invalid UUID in \(slot.uuidKey) in \(configFile.path).") }
+        if id == nil && (slot == .lastWake || name.isEmpty) {
+            fail(slot == .lastWake ? "No successful wake recorded. Wake a speaker with --id UUID or your saved default first."
+                                   : "No default speaker saved. Use --save-name NAME or --save UUID [NAME].")
+        }
+        return SpeakerTarget(id: id, name: name.isEmpty ? nil : name,
+                             updateDefaultOnNameMatch: slot == .preferred && autoUpdateUUID)
     }
+
+    private var autoUpdateUUID: Bool { value(for: "autoupdate_uuid").lowercased() == "true" }
 
     /// Replace existing entries in place or append missing keys to a hand-written config.
     private mutating func set(_ key: String, to value: String) {
@@ -120,21 +130,45 @@ struct Configuration {
         }
     }
 
-    /// Lock the read-modify-write cycle so concurrent wakes and saves keep both selections.
+    /// Save an explicit selection or record the speaker that answered a wake request.
     static func store(_ target: SpeakerTarget, in slot: SpeakerSlot) {
+        update { config in
+            config.set(slot.uuidKey, to: target.id?.uuidString ?? "")
+            config.set(slot.nameKey, to: target.name ?? "")
+            return true
+        }
+    }
+
+    /// Cache the resolved default before connecting if its saved UUID and name still match the scan target.
+    static func updateDefaultUUID(for target: SpeakerTarget, to id: UUID) -> Bool {
+        guard target.updateDefaultOnNameMatch, let name = target.name, id != target.id else { return false }
+        return update { config in
+            let slot = SpeakerSlot.preferred
+            let raw = config.value(for: slot.uuidKey)
+            let sameUUID = target.id.map { UUID(uuidString: raw) == $0 } ?? raw.isEmpty
+            guard config.autoUpdateUUID, sameUUID,
+                  config.value(for: slot.nameKey) == name else { return false }
+            config.set(slot.uuidKey, to: id.uuidString)
+            return true
+        }
+    }
+
+    /// Apply an edit to the latest config under the lock. Skip the write if the edit returns false.
+    @discardableResult
+    private static func update(_ change: (inout Configuration) -> Bool) -> Bool {
         // Atomic replacement changes the config inode. A separate lock stays stable across writes.
         let lock = open(configFile.path + ".lock", O_CREAT | O_RDWR, 0o600)
         guard lock >= 0 else { fail("Cannot open config lock: \(String(cString: strerror(errno)))") }
         defer { close(lock) }
         guard flock(lock, LOCK_EX) == 0 else { fail("Cannot lock config: \(String(cString: strerror(errno)))") }
         var config = Configuration()
-        config.set(slot.uuidKey, to: target.id.uuidString)
-        config.set(slot.nameKey, to: target.name ?? "")
+        guard change(&config) else { return false }
         do {
             try (config.lines.joined(separator: "\n") + "\n").write(to: configFile, atomically: true, encoding: .utf8)
         } catch {
             fail("Could not save \(configFile.path): \(error.localizedDescription)")
         }
+        return true
     }
 }
 
@@ -160,19 +194,25 @@ func parseCommand(arguments input: [String]) -> (action: PowerAction, target: Sp
     if arguments.count == 3, arguments.starts(with: ["--off", "--id"]), let id = UUID(uuidString: arguments[2]) {
         return (.powerOff, SpeakerTarget(id: id, name: nil))
     }
-    guard arguments.count >= 2, let id = UUID(uuidString: arguments[1]) else { fail(usage, code: 64) }
-    if arguments[0] == "--id", arguments.count == 2 { return (wakeAction, SpeakerTarget(id: id, name: nil)) }
-    guard arguments[0] == "--save", arguments.count <= 3 else { fail(usage, code: 64) }
-    var name: String?
-    if arguments.count == 3 {
-        let input = arguments[2].trimmingCharacters(in: .whitespaces)
-        guard !input.isEmpty, input.rangeOfCharacter(from: .newlines) == nil else {
-            fail("The optional Bluetooth name must fit on one nonempty line.", code: 64)
-        }
-        name = input
+    guard arguments.count >= 2 else { fail(usage, code: 64) }
+    let id = UUID(uuidString: arguments[1])
+    if arguments[0] == "--id", arguments.count == 2, let id { return (wakeAction, SpeakerTarget(id: id, name: nil)) }
+    let selection: SpeakerTarget
+    switch (arguments[0], arguments.count) {
+    case ("--save-name", 2):
+        selection = SpeakerTarget(id: nil, name: arguments[1].trimmingCharacters(in: .whitespaces))
+    case ("--save", 2...3):
+        guard let id else { fail(usage, code: 64) }
+        let name = arguments.count == 3 ? arguments[2].trimmingCharacters(in: .whitespaces) : nil
+        selection = SpeakerTarget(id: id, name: name)
+    default:
+        fail(usage, code: 64)
     }
-    Configuration.store(SpeakerTarget(id: id, name: name), in: .preferred)
-    print("Saved default speaker \(id) to \(configFile.path)")
+    if let name = selection.name, name.isEmpty || name.rangeOfCharacter(from: .newlines) != nil {
+        fail("The Bluetooth name must fit on one nonempty line.", code: 64)
+    }
+    Configuration.store(selection, in: .preferred)
+    print("Saved default speaker \(arguments[1]) to \(configFile.path)")
     exit(0)
 }
 
@@ -185,6 +225,11 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var writer: CBCharacteristic?
     private var seen = [UUID: String]()
     private var nameMatches = [UUID: CBPeripheral]()
+    private var addressMatches = Set<UUID>()
+    // Read the paired address once for name matching. This lookup does not open an audio connection.
+    private lazy var pairedAddress = target?.name.flatMap { name in
+        (try? BluetoothAudio(address: nil, names: [name]))?.device.addressString
+    }.flatMap(addressBytes)
     private var sent = false
     private var writeAccepted = false
     private var receivedDeviceInfo = false
@@ -252,7 +297,7 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         finish("\(reason) No JBL acknowledgement of the wake request was observed.", code: 2)
     }
 
-    /// After a successful wake, hand off to the paired audio device and verify it in Core Audio.
+    /// For --connect, check Core Audio first because the speaker can reconnect during wake.
     private func connectForAudio(_ peripheral: CBPeripheral) {
         audioConnecting = true
         do {
@@ -279,12 +324,12 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         switch central.state {
         case .poweredOn:
             guard speaker == nil, !central.isScanning else { return }
-            if let target, target.name == nil, let known = central.retrievePeripherals(withIdentifiers: [target.id]).first {
+            if let target, target.name == nil, let id = target.id, let known = central.retrievePeripherals(withIdentifiers: [id]).first {
                 connect(known)
                 return
             }
             log("Scanning for nearby Bluetooth LE devices for 15 seconds…")
-            central.scanForPeripherals(withServices: nil)
+            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: target?.name != nil])
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { self.scanFinished() }
         case .unauthorized: finish("Bluetooth access denied. Check System Settings → Privacy & Security → Bluetooth.", code: 1)
         case .poweredOff: finish("Turn Bluetooth on in System Settings and run again.", code: 1)
@@ -299,8 +344,15 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? peripheral.name
         if let target {
             guard speaker == nil else { return }
-            if peripheral.identifier == target.id { connect(peripheral) }
-            else if let savedName = target.name, name == savedName { nameMatches[peripheral.identifier] = peripheral }
+            let id = peripheral.identifier
+            if id == target.id { connect(peripheral); return }
+            guard let savedName = target.name else { return }
+            if name == savedName { nameMatches[id] = peripheral }
+            // Name and manufacturer data can arrive in separate reports for one peripheral.
+            if let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+               let pairedAddress, advertisesPairedAddress(pairedAddress, in: data) {
+                addressMatches.insert(id)
+            }
             return
         }
         // A later advertisement may supply a name for a previously unnamed entry.
@@ -310,20 +362,26 @@ final class PartyBox: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    /// Resolve an unambiguous name match after the scan, or finish a discovery-only run.
+    /// Among exact name matches, prefer one paired-address match. Leave ambiguous entries for the user.
     private func scanFinished() {
         guard speaker == nil else { return }
         guard let target else { finish("Scan complete. Devices found: \(seen.count).", code: 0) }
-        if nameMatches.count == 1, let match = nameMatches.values.first {
-            log("Saved UUID was absent. Using the only visible entry named \(target.name ?? "").")
+        let pairedMatches = nameMatches.filter { addressMatches.contains($0.key) }
+        let candidates = pairedMatches.isEmpty ? nameMatches : pairedMatches
+        if candidates.count == 1, let match = candidates.values.first {
+            let reason = pairedMatches.isEmpty ? "one exact name match" : "matched the paired Bluetooth audio address"
+            log("Selected \(target.name ?? "speaker") (\(match.identifier)): \(reason).")
+            if Configuration.updateDefaultUUID(for: target, to: match.identifier) {
+                log("Updated default_uuid to \(match.identifier).")
+            }
             connect(match)
             return
         }
         if nameMatches.count > 1 {
             let ids = nameMatches.keys.map(\.uuidString).sorted().joined(separator: "\n")
-            finish("Several entries match the saved name. Test your speaker with --id before saving a new UUID.\n\(ids)", code: 1)
+            finish("Several entries match the saved name and the paired Bluetooth address could not identify a single entry. Test your speaker with --id.\n\(ids)", code: 1)
         }
-        if let known = central.retrievePeripherals(withIdentifiers: [target.id]).first {
+        if let id = target.id, let known = central.retrievePeripherals(withIdentifiers: [id]).first {
             connect(known)
             return
         }
